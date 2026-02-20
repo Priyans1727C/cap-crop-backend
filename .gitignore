@@ -1,0 +1,15 @@
+venv/
+.env
+*.env
+*.pyc
+__pycache__/
+__init__*.py
+db.sqlite3
+media/
+*.log
+
+migrations/
+
+checklist.md
+data/
+.github/
