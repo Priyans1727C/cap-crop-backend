@@ -94,7 +94,10 @@ class UserRegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True,min_length = 8)
     class Meta:
         model = User
-        fields = ("email","password")
+        fields = ("email","password","full_name")
+        extra_kwargs = {
+            "full_name": {"required": False, "allow_blank": True},
+        }
         
     def validate_email(self, value):
         # Use .only('id') to minimize DB load
