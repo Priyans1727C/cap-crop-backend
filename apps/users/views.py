@@ -1,7 +1,5 @@
 from django.shortcuts import render
-
-# Create your views here.
-from django.shortcuts import render
+import logging
 from django.contrib.auth import get_user_model
 from rest_framework import status
 from .serializers import UserSafeSerializer,UpdateUserSerializer,UserRegisterSerializer,RoleTokenObtainPairSerializer,UserChangePassword,UserEmailSerializer,ResetPasswordSerializer,UserProfileSerializer
@@ -23,11 +21,14 @@ from apps.users.services.verification_service import VerificationService
 from django.utils.http import urlsafe_base64_decode
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from .throttling import (LoginBurstThrottle, LoginSustainedThrottle)
+from kombu.exceptions import OperationalError
 # Create your views here.
 from .tasks import send_verification_email,send_verification_password_email
 
 User = get_user_model()
 from .models import UserProfile
+
+logger = logging.getLogger(__name__)
 
 
 class UserView(APIView):
@@ -59,7 +60,25 @@ class UserRegisterView(APIView):
         ser.is_valid(raise_exception=True)
         user = ser.save()
         base_url = request.build_absolute_uri("/")
-        send_verification_email.delay(user_id=user.id, base_url=base_url)
+        try:
+            send_verification_email.delay(user_id=user.id, base_url=base_url)
+        except OperationalError:
+            logger.warning(
+                "Celery broker unavailable while queuing verification email for user_id=%s. Falling back to synchronous send.",
+                user.id,
+            )
+            try:
+                send_verification_email.run(user_id=user.id, base_url=base_url)
+            except Exception:
+                logger.exception(
+                    "Fallback synchronous verification email send failed for user_id=%s",
+                    user.id,
+                )
+        except Exception:
+            logger.exception(
+                "Unexpected error while queuing verification email for user_id=%s",
+                user.id,
+            )
         return Response(
             {
                 "detail":"User registered successfully. Please verify your email.",
