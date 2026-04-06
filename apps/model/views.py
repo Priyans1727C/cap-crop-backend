@@ -20,6 +20,10 @@ class CropInputSerializer(serializers.Serializer):
 	ph = serializers.FloatField()
 	rainfall = serializers.FloatField()
 
+
+class GeminiChatSerializer(serializers.Serializer):
+	message = serializers.CharField(max_length=4000, allow_blank=False, trim_whitespace=True)
+
 class CropRecommendationAPIView(APIView):
 	recommender = None
 
@@ -143,6 +147,54 @@ class GeminiAgricultureFeedService:
 			return json.loads(text)
 		except json.JSONDecodeError as exc:
 			raise ValueError("Gemini returned non-JSON content") from exc
+
+	def _call_gemini_text(self, prompt):
+		api_key = self._get_api_key()
+		if not api_key:
+			raise ValueError("GEMINI_API_KEY is not configured")
+
+		model = self._get_model()
+		url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+
+		payload = {
+			"contents": [
+				{
+					"parts": [
+						{"text": prompt}
+					]
+				}
+			]
+		}
+
+		request_body = json.dumps(payload).encode("utf-8")
+		req = urllib_request.Request(
+			url=url,
+			data=request_body,
+			headers={"Content-Type": "application/json"},
+			method="POST",
+		)
+
+		try:
+			with urllib_request.urlopen(req, timeout=60) as resp:
+				response_data = json.loads(resp.read().decode("utf-8"))
+		except urllib_error.HTTPError as exc:
+			message = exc.read().decode("utf-8", errors="ignore")
+			raise ValueError(f"Gemini HTTP error: {message}") from exc
+		except urllib_error.URLError as exc:
+			raise ValueError("Could not reach Gemini API") from exc
+
+		text = self._extract_text(response_data).strip()
+		if not text:
+			raise ValueError("Gemini returned empty response")
+		return text
+
+	def get_chat_reply(self, message):
+		prompt = (
+			"You are a concise agriculture assistant for Indian farmers. "
+			"Give practical, safe and clear guidance.\n\n"
+			f"User question: {message}"
+		)
+		return self._call_gemini_text(prompt)
 
 	def get_latest_news(self):
 		cache_key = AgricultureFeedCache.FeedType.NEWS
@@ -280,5 +332,24 @@ class AgricultureSchemesAPIView(APIView):
 		except Exception as exc:
 			return Response(
 				{"detail": "Could not fetch agriculture schemes from Gemini", "error": str(exc)},
+				status=status.HTTP_503_SERVICE_UNAVAILABLE,
+			)
+
+
+class GeminiChatAPIView(APIView):
+	service = GeminiAgricultureFeedService()
+
+	def post(self, request):
+		serializer = GeminiChatSerializer(data=request.data)
+		if not serializer.is_valid():
+			return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+		message = serializer.validated_data["message"]
+		try:
+			reply = self.service.get_chat_reply(message)
+			return Response({"reply": reply}, status=status.HTTP_200_OK)
+		except Exception as exc:
+			return Response(
+				{"detail": "Could not fetch chat response from Gemini", "error": str(exc)},
 				status=status.HTTP_503_SERVICE_UNAVAILABLE,
 			)
