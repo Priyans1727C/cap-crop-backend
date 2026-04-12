@@ -1,7 +1,9 @@
 import json
+import logging
 import re
 from datetime import timedelta
 from html import unescape
+from threading import Lock
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from xml.etree import ElementTree as ET
@@ -11,8 +13,10 @@ from django.utils import timezone
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status, serializers
-from .ml.ml_model import CropRecommender
 from .models import AgricultureFeedCache
+
+
+logger = logging.getLogger(__name__)
 
 class CropInputSerializer(serializers.Serializer):
 	N = serializers.FloatField()
@@ -29,11 +33,17 @@ class GeminiChatSerializer(serializers.Serializer):
 
 class CropRecommendationAPIView(APIView):
 	recommender = None
+	recommender_lock = Lock()
 
 	def get_recommender(self):
-		if not self.recommender:
-			self.recommender = CropRecommender()
-		return self.recommender
+		cls = type(self)
+		if cls.recommender is None:
+			with cls.recommender_lock:
+				if cls.recommender is None:
+					# Import lazily so URL resolver/health checks do not trigger heavy ML imports.
+					from .ml.ml_model import CropRecommender
+					cls.recommender = CropRecommender()
+		return cls.recommender
 
 	def post(self, request):
 		serializer = CropInputSerializer(data=request.data)
@@ -48,7 +58,14 @@ class CropRecommendationAPIView(APIView):
 				data['ph'],
 				data['rainfall']
 			]
-			recommender = self.get_recommender()
+			try:
+				recommender = self.get_recommender()
+			except Exception:
+				logger.exception("Failed to initialize crop recommender")
+				return Response(
+					{"error": "Crop recommendation service is temporarily unavailable."},
+					status=status.HTTP_503_SERVICE_UNAVAILABLE,
+				)
 			crop, confidence, alternatives = recommender.recommend_crop_with_alternatives(user_input)
 			return Response({
 				'recommended_crop': crop,
