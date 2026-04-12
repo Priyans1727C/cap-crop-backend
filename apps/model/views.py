@@ -1,7 +1,10 @@
 import json
+import re
 from datetime import timedelta
+from html import unescape
 from urllib import error as urllib_error
 from urllib import request as urllib_request
+from xml.etree import ElementTree as ET
 from decouple import config
 from django.utils import timezone
 
@@ -59,6 +62,7 @@ class CropRecommendationAPIView(APIView):
 
 class GeminiAgricultureFeedService:
 	CACHE_TTL_HOURS = 6
+	RSS_TIMEOUT_SECONDS = 20
 
 	def _get_api_key(self):
 		return config("GEMINI_API_KEY", default="").strip()
@@ -188,6 +192,161 @@ class GeminiAgricultureFeedService:
 			raise ValueError("Gemini returned empty response")
 		return text
 
+	def _strip_html(self, text):
+		if not text:
+			return ""
+		text = re.sub(r"<[^>]+>", " ", str(text))
+		return re.sub(r"\s+", " ", unescape(text)).strip()
+
+	def _infer_scheme_type(self, title, summary):
+		content = f"{title} {summary}".lower()
+		if "state" in content:
+			return "State"
+		return "Central"
+
+	def _infer_scheme_category(self, title, summary):
+		content = f"{title} {summary}".lower()
+		if "insurance" in content:
+			return "Insurance"
+		return "Subsidy"
+
+	def _extract_benefits(self, summary):
+		text = self._strip_html(summary)
+		if not text:
+			return []
+		parts = [p.strip() for p in re.split(r"[.;]\s+", text) if p.strip()]
+		return parts[:3]
+
+	def _infer_news_category(self, title, summary):
+		content = f"{title} {summary}".lower()
+		if any(x in content for x in ["policy", "ministry", "government", "cabinet"]):
+			return "Policy"
+		if any(x in content for x in ["market", "price", "mandi", "export", "import"]):
+			return "Market"
+		if any(x in content for x in ["rain", "drought", "climate", "weather"]):
+			return "Climate"
+		if any(x in content for x in ["tech", "drone", "ai", "digital", "innovation"]):
+			return "Technology"
+		return "Research"
+
+	def _fetch_news_from_rss(self):
+		"""Fetch real-time agriculture news from public RSS search feeds."""
+		rss_urls = [
+			"https://news.google.com/rss/search?q=India+agriculture+news&hl=en-IN&gl=IN&ceid=IN:en",
+			"https://news.google.com/rss/search?q=Indian+farming+policy+market+update&hl=en-IN&gl=IN&ceid=IN:en",
+		]
+
+		items = []
+		seen_links = set()
+
+		for rss_url in rss_urls:
+			try:
+				with urllib_request.urlopen(rss_url, timeout=self.RSS_TIMEOUT_SECONDS) as resp:
+					raw_xml = resp.read()
+			except Exception:
+				continue
+
+			try:
+				root = ET.fromstring(raw_xml)
+			except ET.ParseError:
+				continue
+
+			for entry in root.findall("./channel/item"):
+				title = (entry.findtext("title") or "").strip()
+				link = (entry.findtext("link") or "").strip()
+				description = (entry.findtext("description") or "").strip()
+				pub_date = (entry.findtext("pubDate") or "").strip()
+
+				if not title or not link or link in seen_links:
+					continue
+
+				seen_links.add(link)
+				summary = self._strip_html(description)[:320]
+
+				items.append(
+					{
+						"id": len(items) + 1,
+						"title": title,
+						"summary": summary,
+						"category": self._infer_news_category(title, summary),
+						"date": pub_date[:16],
+						"readTime": "4 min",
+						"tag": "new",
+						"emoji": "🌾",
+						"url": link,
+					}
+				)
+
+				if len(items) >= 8:
+					break
+
+			if len(items) >= 8:
+				break
+
+		return items[:8]
+
+	def _fetch_schemes_from_rss(self):
+		"""Fetch real-time agriculture scheme updates from public RSS search feeds."""
+		rss_urls = [
+			"https://news.google.com/rss/search?q=Indian+agriculture+government+schemes&hl=en-IN&gl=IN&ceid=IN:en",
+			"https://news.google.com/rss/search?q=PM-KISAN+or+crop+insurance+scheme+India&hl=en-IN&gl=IN&ceid=IN:en",
+		]
+
+		items = []
+		seen_links = set()
+
+		for rss_url in rss_urls:
+			try:
+				with urllib_request.urlopen(rss_url, timeout=self.RSS_TIMEOUT_SECONDS) as resp:
+					raw_xml = resp.read()
+			except Exception:
+				continue
+
+			try:
+				root = ET.fromstring(raw_xml)
+			except ET.ParseError:
+				continue
+
+			for entry in root.findall("./channel/item"):
+				title = (entry.findtext("title") or "").strip()
+				link = (entry.findtext("link") or "").strip()
+				description = (entry.findtext("description") or "").strip()
+				pub_date = (entry.findtext("pubDate") or "").strip()
+
+				if not title or not link or link in seen_links:
+					continue
+
+				seen_links.add(link)
+				summary = self._strip_html(description)[:350]
+				benefits = self._extract_benefits(description)
+
+				items.append(
+					{
+						"id": len(items) + 1,
+						"name": title[:80],
+						"fullName": title,
+						"status": "Ongoing",
+						"type": self._infer_scheme_type(title, summary),
+						"category": self._infer_scheme_category(title, summary),
+						"amount": "",
+						"deadline": None,
+						"launch": pub_date[:16],
+						"description": summary,
+						"eligibility": "Refer official notification for eligibility criteria.",
+						"benefits": benefits,
+						"icon": "🌾",
+						"link": link,
+					}
+				)
+
+				if len(items) >= 8:
+					break
+
+			if len(items) >= 8:
+				break
+
+		return items[:8]
+
 	def get_chat_reply(self, message):
 		prompt = (
 			"You are a concise agriculture assistant for Indian farmers. "
@@ -242,10 +401,18 @@ class GeminiAgricultureFeedService:
 
 			self._cache_set(cache_key, cleaned_items)
 			return cleaned_items
-		except Exception:
+		except Exception as exc:
 			if stale_payload is not None:
 				return stale_payload
-			raise ValueError("Could not fetch news from Gemini API and no cached data available")
+
+			fallback_items = self._fetch_news_from_rss()
+			if fallback_items:
+				self._cache_set(cache_key, fallback_items)
+				return fallback_items
+
+			raise ValueError(
+				f"Could not fetch news from Gemini API and no cached data available: {exc}"
+			)
 
 	def get_latest_schemes(self):
 		cache_key = AgricultureFeedCache.FeedType.SCHEMES
@@ -302,10 +469,18 @@ class GeminiAgricultureFeedService:
 
 			self._cache_set(cache_key, cleaned_items)
 			return cleaned_items
-		except Exception:
+		except Exception as exc:
 			if stale_payload is not None:
 				return stale_payload
-			raise ValueError("Could not fetch schemes from Gemini API and no cached data available")
+
+			fallback_items = self._fetch_schemes_from_rss()
+			if fallback_items:
+				self._cache_set(cache_key, fallback_items)
+				return fallback_items
+
+			raise ValueError(
+				f"Could not fetch schemes from Gemini API and no cached data available: {exc}"
+			)
 
 
 class AgricultureNewsAPIView(APIView):
