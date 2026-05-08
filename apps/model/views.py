@@ -9,6 +9,7 @@ from urllib import request as urllib_request
 from xml.etree import ElementTree as ET
 from decouple import config
 from django.utils import timezone
+import numpy as np
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -58,22 +59,46 @@ class CropRecommendationAPIView(APIView):
 				data['ph'],
 				data['rainfall']
 			]
+			# Try lightweight ml_model2 predictor first (artifacts-based). Fall back to CropRecommender.
 			try:
-				recommender = self.get_recommender()
+				from .ml import ml_model2
+				pred = ml_model2.predict_crop(user_input)
+				recommended = pred.get('label')
+				proba = pred.get('proba')
+				confidence = None
+				if proba:
+					# proba may be a nested list for batch; take first row's max
+					arr = np.array(proba)
+					if arr.ndim == 2:
+						confidence = float(np.max(arr[0]))
+					elif arr.ndim == 1:
+						confidence = float(np.max(arr))
+				alternatives = pred.get('alternatives', [])
+				shap_values = pred.get('shap_values', [])
+				return Response({
+					'recommended_crop': recommended,
+					'confidence': confidence,
+					'alternatives': alternatives,
+					'shap_values': shap_values,
+				})
 			except Exception:
-				logger.exception("Failed to initialize crop recommender")
-				return Response(
-					{"error": "Crop recommendation service is temporarily unavailable."},
-					status=status.HTTP_503_SERVICE_UNAVAILABLE,
-				)
-			crop, confidence, alternatives = recommender.recommend_crop_with_alternatives(user_input)
-			return Response({
-				'recommended_crop': crop,
-				'confidence': confidence,
-				'alternatives': [
-					{'crop': alt[0], 'confidence': alt[1]} for alt in alternatives
-				]
-			})
+				logger.exception("ml_model2 predictor failed, falling back to CropRecommender")
+				try:
+					recommender = self.get_recommender()
+				except Exception:
+					logger.exception("Failed to initialize crop recommender")
+					return Response(
+						{"error": "Crop recommendation service is temporarily unavailable."},
+						status=status.HTTP_503_SERVICE_UNAVAILABLE,
+					)
+				crop, confidence, alternatives = recommender.recommend_crop_with_alternatives(user_input)
+				return Response({
+					'recommended_crop': crop,
+					'confidence': confidence,
+					'alternatives': [
+						{'crop': alt[0], 'confidence': alt[1]} for alt in alternatives
+					]
+				})
 		return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 

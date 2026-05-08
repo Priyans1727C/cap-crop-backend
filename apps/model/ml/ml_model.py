@@ -36,25 +36,16 @@ class CropRecommender:
         input_df = pd.DataFrame([input_data], columns=self.feature_names)
         input_scaled = self.scaler.transform(input_df)
         probs = self.model.predict_proba(input_scaled)[0]
-        best_idx = np.argmax(probs)
+        best_idx = int(np.argmax(probs))
         best_crop = self.encoder.inverse_transform([best_idx])[0]
-        best_conf = probs[best_idx]
-        variations = []
-        for _ in range(100):
-            noise = np.random.normal(0, 0.05, size=len(input_data))
-            new_sample = np.array(input_data) * (1 + noise)
-            variations.append(new_sample)
-        variations_df = pd.DataFrame(variations, columns=self.feature_names)
-        variations_scaled = self.scaler.transform(variations_df)
-        preds = self.model.predict(variations_scaled)
-        unique, counts = np.unique(preds, return_counts=True)
-        crop_freq = dict(zip(unique, counts))
-        crop_freq.pop(best_idx, None)
-        sorted_alts = sorted(crop_freq.items(), key=lambda x: x[1], reverse=True)
+        best_conf = float(probs[best_idx])
+
+        # Build alternatives from top probabilities (excluding best)
         alternatives = []
-        total = sum(counts)
-        for idx, count in sorted_alts[:3]:
-            crop_name = self.encoder.inverse_transform([idx])[0]
-            confidence = count / total
-            alternatives.append((crop_name, confidence))
+        top_idx = probs.argsort()[::-1]
+        for idx in top_idx[1:4]:
+            alt_name = self.encoder.inverse_transform([int(idx)])[0]
+            alt_conf = float(probs[int(idx)])
+            alternatives.append((alt_name, alt_conf))
+
         return best_crop, best_conf, alternatives
